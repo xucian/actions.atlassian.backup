@@ -1,0 +1,147 @@
+name: "actions.atlassian.backup"
+description: "Backups Jira and Confluence in a separata branch per backup"
+inputs:
+  host:
+    description: "E.g. yoursite.atlassian.net"
+    required: true
+  account:
+    description: "Email of the user whose Atlassian API token will be used"
+    required: true
+  key:
+    description: "Atlassian API key assigned to account (Recommended to use an account that has read-only access to the site)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:  
+    - name: Install yq if needed
+      shell: bash
+      run: |
+        if ! command -v yq &> /dev/null
+        then
+            echo "yq not installed, installing now"
+            sudo snap install yq
+        fi
+        
+    - name: Install virtualenv
+      shell: bash
+      run: pip install virtualenv
+
+    - name: Checkout jira-backup-py repo
+      uses: actions/checkout@v3
+      with:
+        repository: datreeio/jira-backup-py
+        path: jira-backup-py
+        ref: e7cd54fe3831d5ec5f9b4ba585c7fe78fd66691a
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip' # caching pip dependencies
+
+    - name: Run Jira and Confluence backup script
+      working-directory: jira-backup-py
+      shell: bash
+      run: |
+          echo 'Setup venv and requirements'
+          virtualenv venv
+          source venv/bin/activate
+          pip install -r requirements.txt
+
+          echo 'Setup config.yaml'
+          yq -i '.HOST_URL = "${{ inputs.host }}"' config.yaml
+          yq -i '.USER_EMAIL = "${{ inputs.account }}"' config.yaml
+          yq -i '.API_TOKEN = "${{ inputs.key }}"' config.yaml
+          yq -i '.INCLUDE_ATTACHMENTS = "true"' config.yaml
+          yq -i '.DOWNLOAD_LOCALLY = "true"' config.yaml
+          # No S3 upload for now
+          yq -i '.UPLOAD_TO_S3.S3_BUCKET = ""' config.yaml
+
+          echo 'Run the thing (Confluence)'
+          venv/bin/python backup.py -c
+
+          echo 'Run the thing (Jira)'
+          venv/bin/python backup.py -j
+
+          echo 'Displaying current dir rec'
+
+    - name: Moving the backup zips outside
+      shell: bash
+      run: |
+          echo 'Moving backups out of the jira-backup-py repo folder'
+          if [ -d backup ]; then
+            rm -rf backup
+          fi
+          mkdir -p backup
+          mv jira-backup-py/backups/*.zip backup/
+          rm -rf jira-backup-py
+          
+          echo 'Displaying current dir rec'
+          ls -R .
+
+    - name: Compose name of the backup and branch
+      shell: bash
+      run: |
+        DATE=$(date +%d-%m-%Y"--"%H-%M-%S)
+
+        branch_name="backups/$DATE"
+        echo "V_BRANCH_NAME=$branch_name" >> $GITHUB_ENV
+        
+    - name: Create branch for backup
+      shell: bash
+      # Redirecting output to null so it won't display 'fatal'
+      run: |
+        (git checkout -B $V_BRANCH_NAME --track origin/$V_BRANCH_NAME > /dev/null 2>&1) || git checkout -B $V_BRANCH_NAME
+        
+    - name: "Git pull to avoid 'exit status 128 fatal: bad object'"
+      shell: bash
+      # Redirecting output to null so it won't display 'fatal'
+      ## For the --allow-unrelated-histories use: https://stackoverflow.com/a/40107973
+      #run: (git pull origin $V_BRANCH_NAME --allow-unrelated-histories > /dev/null 2>&1) || echo "Remote branch doesn't exist. Skipping.."
+      run: |
+        (git pull origin $V_BRANCH_NAME > /dev/null 2>&1) || echo "Remote branch doesn't exist. Skipping.."
+    
+    - name: LFS pull
+      shell: bash
+#     run: git lfs pull && git add . && git reset --hard 
+      run: git lfs pull
+          
+    - name: Configure name and email of git committer (required by git to identify the commit)
+      shell: bash
+      run: |
+        git config user.email "${{ inputs.account }}"
+        git config user.name "CI"
+
+    - name: Add, commit, push changes
+      shell: bash
+      run: |
+        git add -A
+        num_changes=$(git status -s -uno | wc -l)
+        if [ $num_changes == 0 ]; then
+          echo "Nothing to commit. Skipping.."
+        else
+          git commit -m "$num_changes changes"
+          
+          git_push() {
+            # --force-with-lease is --force, but it doesn't allow overwriting if the remote was changed since our last fetch
+            git push -u --force-with-lease origin $V_BRANCH_NAME
+          }
+          
+          wait_retry_git_pull_push() {
+            ## For the --allow-unrelated-histories use: https://stackoverflow.com/a/40107973
+            #sleep 2 && git pull origin $V_BRANCH_NAME --allow-unrelated-histories && git lfs pull && git_push
+            sleep 2 && git pull origin $V_BRANCH_NAME && git lfs pull && git_push
+          }
+          
+          # We sometimes get "Updates were rejected because the tip of your current branch is behind" so we do a naive retry mechanism
+          max_retry=10
+          counter=0
+          until (git_push || wait_retry_git_pull_push)
+          do
+              sleep 1
+              [[ counter -eq $max_retry ]] && echo "Failed!" && exit 1
+              echo "Trying again. Try #$counter"
+              ((counter++))
+          done
+        fi
