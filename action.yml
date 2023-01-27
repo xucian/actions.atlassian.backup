@@ -11,6 +11,9 @@ inputs:
     description: "Atlassian API key assigned to account (Recommended to use an account that has read-only access to the site)"
     required: true
 
+branding:
+  icon: briefcase
+
 runs:
   using: "composite"
   steps:  
